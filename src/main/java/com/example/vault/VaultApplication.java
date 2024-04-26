@@ -32,8 +32,6 @@ class VaultConfig {
         System.out.println("username:"+ environment.getProperty("spring.datasource.username"));
         System.out.println("password:"+environment.getProperty("spring.datasource.password"));
 
-
-
         var vaultCredsPath = String.format("%s/creds/%s", databaseBackend, databaseRole);
         leaseContainer.addLeaseListener(event -> {
             if (vaultCredsPath.equals(event.getSource().getPath())) {
