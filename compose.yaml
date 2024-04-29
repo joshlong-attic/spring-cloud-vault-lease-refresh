@@ -1,7 +1,7 @@
 services:
 
   postgres:
-    image: 'postgres:latest'
+    image: 'postgres:14.11'
     environment:
       - 'POSTGRES_DB=payments'
       - 'POSTGRES_PASSWORD=postgres-admin-password'
