@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e -o pipefail
 
+vault kv put secret/vault-demo db-password=tiger
+
 vault secrets enable -path='database' database
 
 vault write database/config/payments \

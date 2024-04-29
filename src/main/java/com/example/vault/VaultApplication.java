@@ -1,5 +1,6 @@
 package com.example.vault;
 
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -10,11 +11,12 @@ import org.springframework.cloud.context.refresh.ContextRefresher;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.Environment;
+import org.springframework.scheduling.annotation.EnableScheduling;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.vault.core.lease.SecretLeaseContainer;
 import org.springframework.vault.core.lease.event.SecretLeaseExpiredEvent;
 
 import javax.sql.DataSource;
-import java.util.logging.Logger;
 
 @SpringBootApplication
 public class VaultApplication {
@@ -25,7 +27,10 @@ public class VaultApplication {
 }
 
 @Configuration
+@EnableScheduling
 class VaultConfig {
+    @Autowired
+    ContextRefresher contextRefresher;
 
     // Needs something to refresh
     @Bean
@@ -38,7 +43,6 @@ class VaultConfig {
     VaultConfig(@Value("${spring.cloud.vault.database.role}") String databaseRole,
                 @Value("${spring.cloud.vault.database.backend}") String databaseBackend,
                 SecretLeaseContainer leaseContainer,
-                ContextRefresher contextRefresher ,
                 Environment environment) {
 
         System.out.println("reading environment configuration");
@@ -56,5 +60,12 @@ class VaultConfig {
                 }
             }
         });
+    }
+
+    @Scheduled(initialDelayString="${kv.refresh-interval}",
+            fixedDelayString = "${kv.refresh-interval}")
+    public void refresher() {
+        contextRefresher.refresh();
+        System.out.println("refresh KV secret");
     }
 }
