@@ -7,10 +7,9 @@ import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.boot.autoconfigure.jdbc.DataSourceProperties;
 import org.springframework.boot.jdbc.DataSourceBuilder;
-import org.springframework.cloud.context.config.annotation.RefreshScope;
-import org.springframework.cloud.context.refresh.ContextRefresher;
 import org.springframework.cloud.endpoint.event.RefreshEvent;
 import org.springframework.context.ApplicationEventPublisher;
+import org.springframework.context.ApplicationListener;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.jdbc.core.simple.JdbcClient;
@@ -18,13 +17,29 @@ import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Controller;
 import org.springframework.vault.core.lease.SecretLeaseContainer;
+import org.springframework.vault.core.lease.domain.RequestedSecret;
+import org.springframework.vault.core.lease.event.SecretLeaseCreatedEvent;
 import org.springframework.vault.core.lease.event.SecretLeaseExpiredEvent;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.ResponseBody;
 
 import javax.sql.DataSource;
+import java.io.PrintWriter;
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.sql.SQLFeatureNotSupportedException;
 import java.time.Instant;
-import java.util.Map;
+import java.util.Collection;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.logging.Logger;
+
+/**
+ * - reflection
+ * - serialization
+ * - jni
+ * - jdk proxies
+ * - resource loading
+ */
 
 @SpringBootApplication
 public class VaultApplication {
@@ -33,25 +48,90 @@ public class VaultApplication {
         SpringApplication.run(VaultApplication.class, args);
     }
 
+
     @Bean
-    @RefreshScope
     DataSource dataSource(DataSourceProperties properties) {
-        var log = LogFactory.getLog(getClass());
-        var db = DataSourceBuilder //
+        return new DataSourceRefreshListener(properties);
+    }
+}
+
+/* yuck. */
+class DataSourceRefreshListener implements DataSource, ApplicationListener<RefreshEvent> {
+
+    private final DataSourceProperties properties;
+    private final AtomicReference<DataSource> delegate = new AtomicReference<>();
+    private final Object monitor = new Object();
+
+    DataSourceRefreshListener(DataSourceProperties dataSourceProperties) {
+        this.properties = dataSourceProperties;
+        this.reset();
+    }
+
+    private void reset() {
+        synchronized (this.monitor) {
+            this.delegate.set(this.build());
+        }
+    }
+
+    private DataSource build() {
+        System.out.println(properties.getUrl() + ":" + properties.getUsername() + ":" + properties.getPassword());
+        return DataSourceBuilder //
                 .create()//
                 .url(properties.getUrl()) //
                 .username(properties.getUsername()) //
                 .password(properties.getPassword()) //
                 .build();
-        log.info(
-                properties.getUrl() + ':' +
-                        properties.getUsername() + ':' +
-                        properties.getPassword()
-        );
-        return db;
     }
 
+    @Override
+    public Connection getConnection() throws SQLException {
+        return delegate.get().getConnection();
+    }
 
+    @Override
+    public Connection getConnection(String username, String password) throws SQLException {
+        return delegate.get().getConnection(username, password);
+    }
+
+    @Override
+    public PrintWriter getLogWriter() throws SQLException {
+        return delegate.get().getLogWriter();
+    }
+
+    @Override
+    public void setLogWriter(PrintWriter out) throws SQLException {
+        delegate.get().setLogWriter(out);
+    }
+
+    @Override
+    public void setLoginTimeout(int seconds) throws SQLException {
+        delegate.get().setLoginTimeout(seconds);
+    }
+
+    @Override
+    public int getLoginTimeout() throws SQLException {
+        return delegate.get().getLoginTimeout();
+    }
+
+    @Override
+    public <T> T unwrap(Class<T> iface) throws SQLException {
+        return delegate.get().unwrap(iface);
+    }
+
+    @Override
+    public boolean isWrapperFor(Class<?> iface) throws SQLException {
+        return delegate.get().isWrapperFor(iface);
+    }
+
+    @Override
+    public Logger getParentLogger() throws SQLFeatureNotSupportedException {
+        return delegate.get().getParentLogger();
+    }
+
+    @Override
+    public void onApplicationEvent(RefreshEvent event) {
+        reset();
+    }
 }
 
 
@@ -69,7 +149,7 @@ class PaymentsController {
     }
 
     @GetMapping("/payments")
-    Map<String, Object> hello() {
+    Collection<Payment> payments() {
         var payments = this.db
                 .sql("select * from payments")
                 .query((rs, rowNum) -> new Payment(
@@ -79,12 +159,9 @@ class PaymentsController {
                         rs.getTimestamp("created_at").toInstant()
                 ))
                 .list();
-        return Map.of("ok", payments);
-
+        return payments;
     }
-
 }
-
 
 @Configuration
 @EnableScheduling
@@ -92,31 +169,33 @@ class VaultConfiguration {
 
     private final Log log = LogFactory.getLog(getClass());
 
-    private final ContextRefresher contextRefresher;
-
     private final ApplicationEventPublisher publisher;
 
     VaultConfiguration(@Value("${spring.cloud.vault.database.role}") String databaseRole,
                        @Value("${spring.cloud.vault.database.backend}") String databaseBackend,
                        SecretLeaseContainer leaseContainer,
-                       ContextRefresher contextRefresher, ApplicationEventPublisher publisher) {
-        this.contextRefresher = contextRefresher;
+                       ApplicationEventPublisher publisher) {
         this.publisher = publisher;
         var vaultCredsPath = String.format("%s/creds/%s", databaseBackend, databaseRole);
         leaseContainer.addLeaseListener(event -> {
-            if (vaultCredsPath.equals(event.getSource().getPath())) {
-                if (event instanceof SecretLeaseExpiredEvent) {
-                    publisher.publishEvent(new RefreshEvent(this, null, "vault or bust!"));
-//                    contextRefresher.refresh();
-                }
+            if (event instanceof SecretLeaseExpiredEvent && event.getSource().getMode() == RequestedSecret.Mode.RENEW) {
+                log.info("==> Replace RENEW lease by a ROTATE one.");
+                leaseContainer.requestRotatingSecret(vaultCredsPath);
+            }//
+            else if (event instanceof SecretLeaseCreatedEvent && event.getSource().getMode() == RequestedSecret.Mode.ROTATE) {
+                refresh();
             }
         });
     }
 
-    @Scheduled(initialDelayString="${kv.refresh-interval}",
-            fixedDelayString = "${kv.refresh-interval}")
+    @Scheduled(initialDelayString = "${kv.refresh-interval}", fixedDelayString = "${kv.refresh-interval}")
     void refresher() {
-        contextRefresher.refresh();
+        refresh();
         log.info("refresh KV secret");
+    }
+
+    private void refresh() {
+        log.info("refresh()!");
+        publisher.publishEvent(new RefreshEvent(this, null, "vault or bust!"));
     }
 }
