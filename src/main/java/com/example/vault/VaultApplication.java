@@ -1,7 +1,9 @@
 package com.example.vault;
 
+import org.aopalliance.intercept.MethodInterceptor;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.springframework.aop.framework.ProxyFactoryBean;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -31,6 +33,7 @@ import java.sql.SQLFeatureNotSupportedException;
 import java.time.Instant;
 import java.util.Collection;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Function;
 import java.util.logging.Logger;
 
 /**
@@ -49,18 +52,62 @@ public class VaultApplication {
     }
 
 
+    interface RefreshedEventListener extends ApplicationListener<RefreshEvent> {
+    }
+
+
+    static void dump(String msg, DataSourceProperties properties) {
+        System.out.println(msg + " : " +
+                properties.getUrl() + ":" +
+                properties.getUsername() + ":" +
+                properties.getPassword());
+
+    }
+
     @Bean
     DataSource dataSource(DataSourceProperties properties) {
-        return new DataSourceRefreshListener(properties);
+
+        var rebuild = (Function<DataSourceProperties, DataSource>) dataSourceProperties -> DataSourceBuilder //
+                .create()//
+                .url(properties.getUrl()) //
+                .username(properties.getUsername()) //
+                .password(properties.getPassword()) //
+                .build();
+
+        var delegate = new AtomicReference<DataSource>();
+        delegate.set(rebuild.apply(properties));
+
+
+        dump("initial", properties);
+
+        var pfb = new ProxyFactoryBean();
+        pfb.addInterface(DataSource.class);
+        pfb.addInterface(RefreshedEventListener.class);
+        pfb.addAdvice((MethodInterceptor) invocation -> {
+            var methodName = invocation.getMethod().getName();
+            System.out.println("method name is " + methodName);
+            if (methodName.equals("onApplicationEvent")) {
+                delegate.set(rebuild.apply(properties));
+                dump("application event", properties);
+                return null;
+            }
+
+            dump("otherwise", properties);
+            return invocation.getMethod().invoke(delegate.get(), invocation.getArguments());
+        });
+        return (DataSource) pfb.getObject();
     }
 }
 
 /* yuck. */
 class DataSourceRefreshListener implements DataSource, ApplicationListener<RefreshEvent> {
 
-    private final DataSourceProperties properties;
     private final AtomicReference<DataSource> delegate = new AtomicReference<>();
+
     private final Object monitor = new Object();
+
+    private final DataSourceProperties properties;
+
 
     DataSourceRefreshListener(DataSourceProperties dataSourceProperties) {
         this.properties = dataSourceProperties;
