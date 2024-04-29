@@ -3,6 +3,8 @@ package com.example.vault;
 import org.aopalliance.intercept.MethodInterceptor;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
+import org.springframework.aop.SpringProxy;
+import org.springframework.aop.framework.Advised;
 import org.springframework.aop.framework.ProxyFactoryBean;
 import org.springframework.aot.hint.RuntimeHints;
 import org.springframework.aot.hint.RuntimeHintsRegistrar;
@@ -17,6 +19,7 @@ import org.springframework.context.ApplicationListener;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.context.annotation.ImportRuntimeHints;
+import org.springframework.core.DecoratingProxy;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.scheduling.annotation.EnableScheduling;
 import org.springframework.scheduling.annotation.Scheduled;
@@ -34,13 +37,6 @@ import java.util.Collection;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 
-/**
- * - reflection
- * - serialization
- * - jni
- * - jdk proxies
- * - resource loading
- */
 
 @SpringBootApplication
 public class VaultApplication {
@@ -50,44 +46,6 @@ public class VaultApplication {
     }
 
 
-    static class RefreshableDataSourceHints implements RuntimeHintsRegistrar {
-
-        @Override
-        public void registerHints(RuntimeHints hints, ClassLoader classLoader) {
-
-        }
-    }
-
-    @Bean
-    @ImportRuntimeHints(RefreshableDataSourceHints.class)
-    DataSource dataSource(DataSourceProperties properties) {
-
-        interface RefreshedEventListener extends ApplicationListener<RefreshEvent> {
-        }
-
-        var rebuild = (Function<DataSourceProperties, DataSource>) dataSourceProperties -> DataSourceBuilder //
-                .create()//
-                .url(properties.getUrl()) //
-                .username(properties.getUsername()) //
-                .password(properties.getPassword()) //
-                .build();
-
-        var delegate = new AtomicReference<>(rebuild.apply(properties));
-
-        var pfb = new ProxyFactoryBean();
-        pfb.addInterface(DataSource.class);
-        pfb.addInterface(RefreshedEventListener.class);
-        pfb.addAdvice((MethodInterceptor) invocation -> {
-            var methodName = invocation.getMethod().getName();
-            if (methodName.equals("onApplicationEvent")) {
-                delegate.set(rebuild.apply(properties));
-                return null;
-            }
-            return invocation.getMethod()
-                    .invoke(delegate.get(), invocation.getArguments());
-        });
-        return (DataSource) pfb.getObject();
-    }
 }
 
 @Controller
@@ -120,32 +78,78 @@ class PaymentsController {
 
 @Configuration
 @EnableScheduling
-class VaultConfiguration {
+@ImportRuntimeHints(RefreshableDataSourceVaultConfiguration.RefreshableDataSourceHints.class)
+class RefreshableDataSourceVaultConfiguration {
 
     private final Log log = LogFactory.getLog(getClass());
 
     private final ApplicationEventPublisher publisher;
 
-    VaultConfiguration(@Value("${spring.cloud.vault.database.role}") String databaseRole,
-                       @Value("${spring.cloud.vault.database.backend}") String databaseBackend,
-                       SecretLeaseContainer leaseContainer,
-                       ApplicationEventPublisher publisher) {
+    RefreshableDataSourceVaultConfiguration(@Value("${spring.cloud.vault.database.role}") String databaseRole,
+                                            @Value("${spring.cloud.vault.database.backend}") String databaseBackend,
+                                            SecretLeaseContainer leaseContainer,
+                                            ApplicationEventPublisher publisher) {
         this.publisher = publisher;
         var vaultCredsPath = String.format("%s/creds/%s", databaseBackend, databaseRole);
         leaseContainer.addLeaseListener(event -> {
-            if (event instanceof SecretLeaseExpiredEvent && event.getSource().getMode() == RequestedSecret.Mode.RENEW) {
-                log.debug("==> Replace RENEW lease by a ROTATE one.");
-                leaseContainer.requestRotatingSecret(vaultCredsPath);
-            }//
-            else if (event instanceof SecretLeaseCreatedEvent && event.getSource().getMode() == RequestedSecret.Mode.ROTATE) {
+            if (event instanceof SecretLeaseExpiredEvent/* && event.getSource().getMode() == RequestedSecret.Mode.RENEW*/) {
+                log.debug("==> seeing an expiration, refreshing.");
                 refresh();
-            }
+            }//
+            /*else if (event instanceof SecretLeaseCreatedEvent && event.getSource().getMode() == RequestedSecret.Mode.ROTATE) {
+                log.debug("==> seeing an expiration, refreshing.");
+                leaseContainer.requestRotatingSecret(vaultCredsPath);
+                refresh();
+            }*/
         });
     }
 
     @Scheduled(initialDelayString = "${kv.refresh-interval}", fixedDelayString = "${kv.refresh-interval}")
     void refresher() {
         refresh();
+    }
+
+    static class RefreshableDataSourceHints implements RuntimeHintsRegistrar {
+
+        @Override
+        public void registerHints(RuntimeHints hints, ClassLoader classLoader) {
+            hints.proxies().registerJdkProxy(DataSource.class, RefreshedEventListener.class,
+                    SpringProxy.class, Advised.class, DecoratingProxy.class);
+        }
+    }
+
+    interface RefreshedEventListener extends ApplicationListener<RefreshEvent> {
+    }
+
+    @Bean
+    DataSource dataSource(DataSourceProperties properties) {
+        var rebuild = (Function<DataSourceProperties, DataSource>) dataSourceProperties -> {
+            System.out.println("just rebuilt the DataSource [" + properties.getUrl() + ":" +
+                    properties.getUsername() + ":" + properties.getPassword() + "]!");
+            return DataSourceBuilder //
+                    .create()//
+                    .url(properties.getUrl()) //
+                    .username(properties.getUsername()) //
+                    .password(properties.getPassword()) //
+                    .build();
+
+        };
+
+        var delegate = new AtomicReference<>(rebuild.apply(properties));
+
+        var pfb = new ProxyFactoryBean();
+        pfb.addInterface(DataSource.class);
+        pfb.addInterface(RefreshedEventListener.class);
+        pfb.addAdvice((MethodInterceptor) invocation -> {
+            var methodName = invocation.getMethod().getName();
+            if (methodName.equals("onApplicationEvent")) {
+                delegate.set(rebuild.apply(properties));
+                return null;
+            }
+            return invocation.getMethod()
+                    .invoke(delegate.get(), invocation.getArguments());
+        });
+        return (DataSource) pfb.getObject();
     }
 
     private void refresh() {
