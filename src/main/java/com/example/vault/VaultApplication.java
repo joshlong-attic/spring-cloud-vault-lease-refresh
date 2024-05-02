@@ -22,7 +22,6 @@ import org.springframework.context.annotation.ImportRuntimeHints;
 import org.springframework.core.DecoratingProxy;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.scheduling.annotation.EnableScheduling;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Controller;
 import org.springframework.vault.core.lease.SecretLeaseContainer;
 import org.springframework.vault.core.lease.domain.RequestedSecret;
@@ -112,11 +111,6 @@ class RefreshableDataSourceVaultConfiguration {
                 }
             }
         });
-    }
-
-    @Scheduled(initialDelayString = "${kv.refresh-interval}", fixedDelayString = "${kv.refresh-interval}")
-    void refresher() {
-        refresh();
     }
 
     static class RefreshableDataSourceHints implements RuntimeHintsRegistrar {
