@@ -87,20 +87,30 @@ class RefreshableDataSourceVaultConfiguration {
 
     RefreshableDataSourceVaultConfiguration(@Value("${spring.cloud.vault.database.role}") String databaseRole,
                                             @Value("${spring.cloud.vault.database.backend}") String databaseBackend,
+                                            DataSourceProperties properties,
                                             SecretLeaseContainer leaseContainer,
                                             ApplicationEventPublisher publisher) {
         this.publisher = publisher;
+
         var vaultCredsPath = String.format("%s/creds/%s", databaseBackend, databaseRole);
         leaseContainer.addLeaseListener(event -> {
-            if (event instanceof SecretLeaseExpiredEvent/* && event.getSource().getMode() == RequestedSecret.Mode.RENEW*/) {
-                log.debug("==> seeing an expiration, refreshing.");
-                refresh();
-            }//
-            /*else if (event instanceof SecretLeaseCreatedEvent && event.getSource().getMode() == RequestedSecret.Mode.ROTATE) {
-                log.debug("==> seeing an expiration, refreshing.");
-                leaseContainer.requestRotatingSecret(vaultCredsPath);
-                refresh();
-            }*/
+            if (vaultCredsPath.equals(event.getSource().getPath())) {
+                if (event instanceof SecretLeaseExpiredEvent && event.getSource().getMode() == RequestedSecret.Mode.RENEW) {
+                    log.info("Expiring lease, rotate database credentials");
+                    leaseContainer.requestRotatingSecret(vaultCredsPath);
+                } else if (event instanceof SecretLeaseCreatedEvent secretLeaseCreatedEvent
+                        && event.getSource().getMode() == RequestedSecret.Mode.ROTATE) {
+
+                    String username = (String) secretLeaseCreatedEvent.getSecrets().get("username");
+                    String password = (String) secretLeaseCreatedEvent.getSecrets().get("password");
+
+                    log.info("Updating database properties : " + username);
+                    properties.setUsername(username);
+                    properties.setPassword(password);
+
+                    refresh();
+                }
+            }
         });
     }
 
@@ -124,8 +134,8 @@ class RefreshableDataSourceVaultConfiguration {
     @Bean
     DataSource dataSource(DataSourceProperties properties) {
         var rebuild = (Function<DataSourceProperties, DataSource>) dataSourceProperties -> {
-            System.out.println("just rebuilt the DataSource [" + properties.getUrl() + ":" +
-                    properties.getUsername() + ":" + properties.getPassword() + "]!");
+            log.info("Building data source: " + properties.getUsername());
+
             return DataSourceBuilder //
                     .create()//
                     .url(properties.getUrl()) //
@@ -153,6 +163,7 @@ class RefreshableDataSourceVaultConfiguration {
     }
 
     private void refresh() {
-        this.publisher.publishEvent(new RefreshEvent(this, null, "vault or bust!"));
+        this.publisher.publishEvent(new RefreshEvent(this, null,
+                "refresh database connection with new Vault credentials"));
     }
 }
